@@ -1,0 +1,99 @@
+name: Deploy Prova Final AWS
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: deploy-provafinal
+  cancel-in-progress: false
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+  deploy:
+    needs: tests
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}/prova-final-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+      - name: Copiar Compose para AWS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST_TEST }}
+          username: ${{ secrets.SSH_USER || 'ubuntu' }}
+          key: ${{ secrets.KEY_TEST }}
+          source: deploy/compose.yml
+          target: /home/ubuntu/provafinal
+          strip_components: 1
+      - name: Atualizar API
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          AUTH0_ISSUER: ${{ vars.AUTH0_ISSUER || secrets.AUTH0_ISSUER }}
+          AUTH0_AUDIENCE: ${{ vars.AUTH0_AUDIENCE || secrets.AUTH0_AUDIENCE }}
+          FRONTEND_ORIGINS: ${{ vars.FRONTEND_ORIGINS || secrets.FRONTEND_ORIGINS }}
+          API_RESOURCE_PATH: ${{ vars.API_RESOURCE_PATH || '/registros' }}
+          API_READ_ROLES: ${{ vars.API_READ_ROLES || 'ADMIN,USER' }}
+          API_WRITE_ROLES: ${{ vars.API_WRITE_ROLES || 'ADMIN' }}
+          APP_PORT: ${{ vars.APP_PORT || '8083' }}
+        with:
+          host: ${{ secrets.HOST_TEST }}
+          username: ${{ secrets.SSH_USER || 'ubuntu' }}
+          key: ${{ secrets.KEY_TEST }}
+          envs: IMAGE,DB_NAME,DB_USER,DB_PASSWORD,AUTH0_ISSUER,AUTH0_AUDIENCE,FRONTEND_ORIGINS,APP_PORT,API_RESOURCE_PATH,API_READ_ROLES,API_WRITE_ROLES
+          script: |
+            set -eu
+            cd /home/ubuntu/provafinal
+            umask 077
+            : "${DB_NAME:?DB_NAME vazio}"
+            : "${DB_USER:?DB_USER vazio}"
+            : "${DB_PASSWORD:?DB_PASSWORD vazio}"
+            : "${AUTH0_ISSUER:?AUTH0_ISSUER vazio}"
+            : "${AUTH0_AUDIENCE:?AUTH0_AUDIENCE vazio}"
+            : "${FRONTEND_ORIGINS:?FRONTEND_ORIGINS vazio}"
+            # Arquivo privado; Compose recebe as variáveis exportadas pelo SSH.
+            # Dotenv privado; valores são validados sem serem exibidos.
+            export IMAGE DB_NAME DB_USER DB_PASSWORD AUTH0_ISSUER AUTH0_AUDIENCE FRONTEND_ORIGINS APP_PORT API_RESOURCE_PATH API_READ_ROLES API_WRITE_ROLES
+            python3 - <<'PYTHON'
+            import os
+            names = ['IMAGE', 'DB_NAME', 'DB_USER', 'DB_PASSWORD', 'AUTH0_ISSUER', 'AUTH0_AUDIENCE', 'FRONTEND_ORIGINS', 'APP_PORT', 'API_RESOURCE_PATH', 'API_READ_ROLES', 'API_WRITE_ROLES']
+            lines = []
+            for name in names:
+                value = os.environ[name]
+                # Senhas simples ou aleatórias URL-safe evitam ambiguidades do dotenv.
+                if any(char in value for char in ["\n", "\r", "'", "\\"]):
+                    raise ValueError('Use valores sem quebra de linha, aspas simples ou barra invertida em ' + name)
+                lines.append(name + "='" + value + "'\n")
+            with open('.env.next', 'w') as file:
+                file.writelines(lines)
+            os.replace('.env.next', '.env')
+            PYTHON
+            docker compose -p provafinal -f compose.yml config --quiet
+            docker compose -p provafinal -f compose.yml pull
+            docker compose -p provafinal -f compose.yml up -d --wait --wait-timeout 120
+            ready=false
+            for attempt in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$APP_PORT${API_RESOURCE_PATH}/_status" || true)
+              if [ "$code" = 401 ]; then ready=true; break; fi
+              sleep 2
+            done
+            if [ "$ready" != true ]; then
+              docker compose -p provafinal -f compose.yml logs --tail 80 api
+              exit 1
+            fi
+            docker compose -p provafinal -f compose.yml ps
